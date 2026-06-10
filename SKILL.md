@@ -1,9 +1,6 @@
 ---
 name: canvas-sjtu
-description: Login, session management, and file operations for Canvas@SJTU (oc.sjtu.edu.cn) via jAccount SSO. Use when the user needs to access Canvas@SJTU, login to oc.sjtu.edu.cn, list courses/assignments, download files, submit assignments, or extract data from Canvas. Handles jAccount captcha login, Playwright-based session persistence, Canvas REST API, and S3 file uploads. Provides a unified CLI (canvas.py) for all operations.
----
-name: canvas-sjtu
-description: Login, session management, and file operations for Canvas@SJTU (oc.sjtu.edu.cn) via jAccount SSO. Use when the user needs to access Canvas@SJTU, login to oc.sjtu.edu.cn, list courses/assignments, download files, submit assignments, or extract data from Canvas. Handles jAccount captcha login, Playwright-based session persistence, Canvas REST API, and S3 file uploads. Provides a unified CLI (canvas.py) for all operations.
+description: Login, session management, file operations, and unified browsing for Canvas@SJTU (oc.sjtu.edu.cn) via jAccount SSO. Use when the user needs to access Canvas@SJTU, login to oc.sjtu.edu.cn, browse courses/assignments/files/announcements/modules, download files, submit assignments, or navigate Canvas via structured paths. Features: navigate() unified browsing primitive (one function for all page-level operations), jAccount captcha login, Playwright session persistence, dual-mode API (Bearer token or Playwright cookies), Canvas REST API, and S3 file uploads. Provides a unified CLI (canvas.py) for all operations.
 ---
 
 # Canvas@SJTU Session Manager
@@ -37,6 +34,7 @@ python scripts/canvas.py <command>
 
 | Command | Function | Safety |
 |---------|----------|--------|
+| `navigate [<path>]` | **Unified browsing primitive** — browse Canvas by path; returns structured JSON for agent consumption | Read-only |
 | `dashboard` | Home overview (active courses + upcoming deadlines) | Read-only |
 | `courses` | List all active courses (force-refresh from API) | Read-only |
 | `files <course>` | List all files in a course | Read-only |
@@ -47,6 +45,29 @@ python scripts/canvas.py <command>
 | `login` | Manual re-login (opens browser) | Write (session) |
 
 `<course>` accepts: numeric ID (e.g., `87954`) or keyword (e.g., `光纤`, `电子线路`).
+
+## Navigate — Unified Browsing Primitive
+
+A single function that replaces all page-level commands. Designed for AI agents to browse Canvas like a human.
+
+```bash
+python canvas.py navigate [<path>]
+```
+
+**Path hierarchy**:
+
+| Path | Returns |
+|------|---------|
+| `/` | Dashboard: active courses + todos |
+| `/courses/:id` | Course home: modules/files/assignments/pages/announcements counts + previews |
+| `/courses/:id/modules` | Module list (with completion state) |
+| `/courses/:id/modules/:mid` | Module items (PPT/视频/实验/etc.) |
+| `/courses/:id/files` | File list (with sizes) |
+| `/courses/:id/assignments` | Assignment list (with scores, submission status) |
+| `/courses/:id/announcements` | Announcement list (with author/dates) |
+| `/courses/:id/pages` | Wiki page list |
+
+**Design**: New API endpoints only need one `if sub == "xxx"` block in `navigate()`. No new CLI command required.
 
 ## Login Flow
 
@@ -77,6 +98,8 @@ The `submit` command implements the 3-step Canvas file upload pipeline:
 ## Architecture
 
 - **API-first**: Uses Canvas REST API (`/api/v1`) instead of HTML scraping
+- **Dual-mode**: Bearer token (lightweight, ~50ms) preferred; Playwright session (~1.5s) fallback
+- **Browsing primitive**: `navigate()` — one function for all page-level operations
 - **Playwright request context**: `p.request.new_context(storage_state=...)` to share session cookies for file downloads and uploads (avoids CORS issues with page-level `fetch()`)
 - **CourseIndex**: 1-hour file cache (`oc_courses.json`) with keyword + numeric ID resolution
 - **Session**: Playwright `storage_state()` JSON → cookies + localStorage → restored via `new_context(storage_state=...)`
@@ -85,7 +108,7 @@ The `submit` command implements the 3-step Canvas file upload pipeline:
 
 | Script | Purpose |
 |--------|---------|
-| `scripts/canvas.py` | **Unified CLI** (all operations) |
+| `scripts/canvas.py` | **Unified CLI** (all operations — navigate, dashboard, files, download, assignments, submit, open, login, token) |
 | `scripts/login.py` | Manual login with browser window, saves session |
 | `scripts/access.py` | Legacy: open Canvas with saved session |
 
