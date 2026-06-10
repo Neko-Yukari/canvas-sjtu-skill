@@ -1,5 +1,7 @@
 # Canvas@SJTU Skill 🎓
 
+hey,你手动使用canvas的日子结束了，现在可以让agent帮你上canvas上找东西。
+
 一个命令行工具，让你不用打开浏览器就能管理上海交通大学 Canvas（oc.sjtu.edu.cn）课程。
 
 ## 我能做什么
@@ -13,7 +15,7 @@
 | 🔑 **自动登录** | jAccount 登录后保存 session，后续免验证码直连 |
 | 🌐 **可扩展** | 基于 Canvas REST API，新增功能只需添加 API 调用 |
 
-## 为什么不用浏览器
+## Agent的优势
 
 - **批处理**：一口气下载所有课件 → 自动按课程分好文件夹
 - **脚本化**：配合定时任务做截止日期提醒
@@ -63,7 +65,7 @@ python scripts/canvas.py <命令>
 ## 安全设计
 
 - **本地运行**：所有数据（cookie、下载文件）存在 `local/` 目录，已加入 `.gitignore`
-- **提交确认**：`submit` 命令显示预览后必须输入大写 `SUBMIT` 才会执行
+- **提交确认**：`submit` 命令显示预览后必须用户确认，输入 `SUBMIT` 才会执行(非脚本强制性)
 - **不存密码**：只保存 Playwright session cookie，不记录 jAccount 密码
 
 ## 技术架构
