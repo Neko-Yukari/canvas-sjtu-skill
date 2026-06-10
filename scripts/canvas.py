@@ -7,6 +7,7 @@ Usage:
     python canvas.py download <course> <kw>      Download files matching keyword
     python canvas.py assignments <course>        List assignments with deadlines
     python canvas.py submit <course> <asgn> <file>  Submit file to assignment (with confirmation)
+    python canvas.py token [<token>]             Set or verify Canvas API token (optional, for lightweight mode)
     python canvas.py login                       Re-login (opens browser)
     python canvas.py open                        Open Canvas in visible browser
 
@@ -17,28 +18,62 @@ Runtime data stored in: ../local/ (gitignored, per-user)
 """
 import argparse, sys, time, re, json, os, urllib.parse
 from pathlib import Path
-from playwright.sync_api import sync_playwright
 
 # ── Skill-local paths (all runtime data in ../local/) ─────
 SKILL_DIR = Path(__file__).resolve().parent.parent
 LOCAL_DIR = SKILL_DIR / "local"
 SESSION_FILE = LOCAL_DIR / "oc_session.json"
+CONFIG_FILE = LOCAL_DIR / "config.json"
 DOWNLOAD_DIR = LOCAL_DIR / "downloads"
 BASE_URL = "https://oc.sjtu.edu.cn"
 API_BASE = f"{BASE_URL}/api/v1"
 
+# ── Config: optional API token (lightweight mode) ─────────
+
+def load_config():
+    if CONFIG_FILE.exists():
+        try:
+            return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+def get_token():
+    return load_config().get("canvas_token", "")
+
+def save_token(token_str):
+    LOCAL_DIR.mkdir(parents=True, exist_ok=True)
+    cfg = load_config()
+    cfg["canvas_token"] = token_str
+    cfg["base_url"] = BASE_URL
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+
 # ── API helpers ──────────────────────────────────────────
 
 def _api_get(endpoint, params=None):
-    """Make authenticated GET request to Canvas API."""
+    """Make authenticated GET request to Canvas API.
+    Prefers Bearer token (lightweight), falls back to Playwright session.
+    """
+    url = endpoint if endpoint.startswith("http") else f"{API_BASE}{endpoint}"
+    token = get_token()
+
+    # Lightweight mode: Bearer token
+    if token:
+        import requests as _r
+        resp = _r.get(url, headers={"Authorization": f"Bearer {token}"}, params=params)
+        if resp.status_code == 401:
+            print("Token invalid or expired. Run: python canvas.py token <new_token>")
+            sys.exit(2)
+        if resp.status_code == 200:
+            return resp.json()
+        return None
+
+    # Heavy mode: Playwright session
     if not SESSION_FILE.exists():
-        print(f"ERROR: No session file at {SESSION_FILE}")
+        print(f"ERROR: No session at {SESSION_FILE} and no token configured.")
         print("Run: python canvas.py login")
         sys.exit(1)
-
-    url = endpoint if endpoint.startswith("http") else f"{API_BASE}{endpoint}"
-
-    # Note: we use sync_playwright for request context to share cookies
+    from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
         req_ctx = p.request.new_context(storage_state=str(SESSION_FILE))
         resp = req_ctx.get(url, params=params)
@@ -55,15 +90,25 @@ def _api_get(endpoint, params=None):
 
 
 def _download_file(file_id, filename, course_name=""):
-    """Download a single file by ID using API request context."""
+    """Download a single file by ID. Prefers Bearer token, falls back to session."""
     safe_name = re.sub(r'[<>:"/\\|?*]', '_', filename)
-    if course_name:
-        out_dir = DOWNLOAD_DIR / course_name
-    else:
-        out_dir = DOWNLOAD_DIR
+    out_dir = DOWNLOAD_DIR / course_name if course_name else DOWNLOAD_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / safe_name
+    token = get_token()
 
+    if token:
+        import requests as _r
+        resp = _r.get(f"{BASE_URL}/files/{file_id}/download?download_frd=1",
+                      headers={"Authorization": f"Bearer {token}"},
+                      allow_redirects=True)
+        if resp.status_code == 200:
+            out_path.write_bytes(resp.content)
+            size_mb = len(resp.content) / 1024 / 1024
+            return out_path, size_mb
+        return None, 0
+
+    from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
         req_ctx = p.request.new_context(storage_state=str(SESSION_FILE))
         resp = req_ctx.get(f"{BASE_URL}/files/{file_id}/download?download_frd=1")
@@ -72,9 +117,8 @@ def _download_file(file_id, filename, course_name=""):
             size_mb = len(resp.body()) / 1024 / 1024
             req_ctx.dispose()
             return out_path, size_mb
-        else:
-            req_ctx.dispose()
-            return None, 0
+        req_ctx.dispose()
+        return None, 0
 
 
 # ── course resolution ────────────────────────────────────
@@ -486,10 +530,82 @@ def cmd_submit(index, course_query, assignment_query, file_path):
 
     # ── Step 1: Upload preflight ──
     print("\n[1/3] Requesting upload preflight...")
+    token = get_token()
+
+    if token:
+        _submit_with_token(cid, a_id, a_name, file_p, file_size, content_type, token)
+    else:
+        _submit_with_session(cid, a_id, a_name, file_p, file_size, content_type)
+
+    # Verify submission
+    sub = _api_get(f"/courses/{cid}/assignments/{a_id}/submissions/self")
+    if sub:
+        st = sub.get("workflow_state", "?")
+        print(f"\n  Final status: {st}")
+        if st in ("submitted", "graded"):
+            at = sub.get("submitted_at", "")
+            print(f"  Submitted at: {at[:19] if at else 'N/A'}")
+
+    print("\n" + "=" * 60)
+    print("SUBMISSION COMPLETE")
+    print("=" * 60)
+
+
+def _submit_with_token(cid, a_id, a_name, file_p, file_size, content_type, token):
+    """Submit using Bearer token (lightweight, no Playwright needed)."""
+    import requests as _r
+    h = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+    body = f"name={urllib.parse.quote(file_p.name)}&size={file_size}&content_type={urllib.parse.quote(content_type)}"
+    r = _r.post(f"{API_BASE}/courses/{cid}/assignments/{a_id}/submissions/self/files",
+                headers=h, data=body)
+    if r.status_code != 200:
+        print(f"ERROR: Upload preflight failed (HTTP {r.status_code})")
+        print(r.text[:500])
+        sys.exit(1)
+
+    ud = r.json()
+    upload_url = ud["upload_url"]
+    upload_params = ud["upload_params"]
+    print(f"  Upload URL obtained: {upload_url[:60]}...")
+
+    print(f"[2/3] Uploading file to cloud storage...")
+    with open(file_p, "rb") as fh:
+        s3_resp = _r.post(upload_url, data=upload_params, files={"file": (file_p.name, fh, content_type)})
+    if s3_resp.status_code not in (200, 201, 204, 303):
+        print(f"ERROR: S3 upload failed (HTTP {s3_resp.status_code})")
+        print(s3_resp.text[:500])
+        sys.exit(1)
+    print(f"  File uploaded successfully (HTTP {s3_resp.status_code}).")
+
+    key = upload_params.get("key", "")
+    attach_match = re.search(r"attachments/(\d+)/", key)
+    if not attach_match:
+        print("WARNING: Could not determine attachment ID.")
+        print(f"Key: {key}")
+        sys.exit(0)
+
+    attach_id = attach_match.group(1)
+    print(f"[3/3] Confirming submission (attachment {attach_id})...")
+    confirm_data = f"submission[submission_type]=online_upload&submission[file_ids][]={attach_id}"
+    cr = _r.post(f"{API_BASE}/courses/{cid}/assignments/{a_id}/submissions",
+                 headers=h, data=confirm_data)
+    print(f"  Submission confirm: HTTP {cr.status_code}")
+    if cr.status_code in (200, 201):
+        try:
+            result = cr.json()
+            print(f"  Status: {result.get('workflow_state', '?')}")
+        except Exception:
+            pass
+
+
+def _submit_with_session(cid, a_id, a_name, file_p, file_size, content_type):
+    """Submit using Playwright session (for when no token is configured)."""
+    from playwright.sync_api import sync_playwright
+
     with sync_playwright() as p:
         req = p.request.new_context(storage_state=str(SESSION_FILE))
 
-        # Get CSRF token from stored cookies
         state = req.storage_state()
         csrf = None
         for c in state.get("cookies", []):
@@ -506,11 +622,8 @@ def cmd_submit(index, course_query, assignment_query, file_path):
             "Accept": "application/json",
         }
         params = f"name={urllib.parse.quote(file_p.name)}&size={file_size}&content_type={urllib.parse.quote(content_type)}"
-        resp = req.post(
-            f"{API_BASE}/courses/{cid}/assignments/{a_id}/submissions/self/files",
-            headers=headers,
-            data=params,
-        )
+        resp = req.post(f"{API_BASE}/courses/{cid}/assignments/{a_id}/submissions/self/files",
+                        headers=headers, data=params)
         if resp.status != 200:
             print(f"ERROR: Upload preflight failed (HTTP {resp.status})")
             print(resp.text()[:500])
@@ -522,72 +635,40 @@ def cmd_submit(index, course_query, assignment_query, file_path):
         upload_params = upload_data["upload_params"]
         print(f"  Upload URL obtained: {upload_url[:60]}...")
 
-        # ── Step 2: Upload to S3 ──
         print(f"[2/3] Uploading file to cloud storage...")
-        with open(file_path, "rb") as fh:
+        with open(file_p, "rb") as fh:
             file_bytes = fh.read()
-
-        multipart = {}
-        for k, v in upload_params.items():
-            multipart[k] = v
-        multipart["file"] = {
-            "name": file_p.name,
-            "mimeType": content_type,
-            "buffer": file_bytes,
-        }
-
+        multipart = {k: v for k, v in upload_params.items()}
+        multipart["file"] = {"name": file_p.name, "mimeType": content_type, "buffer": file_bytes}
         s3_resp = req.post(upload_url, multipart=multipart)
-        s3_status = s3_resp.status
-        if s3_status not in (200, 201, 204, 303):
-            print(f"ERROR: S3 upload failed (HTTP {s3_status})")
+        if s3_resp.status not in (200, 201, 204, 303):
+            print(f"ERROR: S3 upload failed (HTTP {s3_resp.status})")
             print(s3_resp.text()[:500])
             req.dispose()
             sys.exit(1)
-        print(f"  File uploaded successfully (HTTP {s3_status}).")
+        print(f"  File uploaded successfully (HTTP {s3_resp.status}).")
 
-        # ── Step 3: Confirm submission ──
-        # Extract attachment ID from upload_params key path
         key = upload_params.get("key", "")
         attach_match = re.search(r"attachments/(\d+)/", key)
         if not attach_match:
-            print("WARNING: Could not determine attachment ID from upload response.")
-            print("The file was uploaded but submission may need manual confirmation.")
+            print("WARNING: Could not determine attachment ID.")
             print(f"Key: {key}")
             req.dispose()
             sys.exit(0)
 
         attach_id = attach_match.group(1)
         print(f"[3/3] Confirming submission (attachment {attach_id})...")
-
         confirm_data = f"submission[submission_type]=online_upload&submission[file_ids][]={attach_id}"
-        confirm_resp = req.post(
-            f"{API_BASE}/courses/{cid}/assignments/{a_id}/submissions",
-            headers=headers,
-            data=confirm_data,
-        )
+        confirm_resp = req.post(f"{API_BASE}/courses/{cid}/assignments/{a_id}/submissions",
+                                headers=headers, data=confirm_data)
         print(f"  Submission confirm: HTTP {confirm_resp.status}")
         if confirm_resp.status in (200, 201):
             try:
                 result = confirm_resp.json()
-                state = result.get("workflow_state", "?")
-                print(f"  Status: {state}")
+                print(f"  Status: {result.get('workflow_state', '?')}")
             except Exception:
                 pass
-
         req.dispose()
-
-    # Verify submission
-    sub = _api_get(f"/courses/{cid}/assignments/{a_id}/submissions/self")
-    if sub:
-        st = sub.get("workflow_state", "?")
-        print(f"\n  Final status: {st}")
-        if st in ("submitted", "graded"):
-            at = sub.get("submitted_at", "")
-            print(f"  Submitted at: {at[:19] if at else 'N/A'}")
-
-    print("\n" + "=" * 60)
-    print("SUBMISSION COMPLETE")
-    print("=" * 60)
 
 
 def _guess_mime(file_path):
@@ -620,6 +701,7 @@ def _guess_mime(file_path):
 
 def cmd_open():
     """Open Canvas in visible browser with saved session."""
+    from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False)
         ctx = browser.new_context(storage_state=str(SESSION_FILE))
@@ -629,6 +711,39 @@ def cmd_open():
         print("Browser window is open. Press Enter here to close...")
         input()
         browser.close()
+
+
+def cmd_token(args):
+    """Set or verify Canvas API token."""
+    if args.token:
+        save_token(args.token.strip())
+        print("Token saved to local/config.json")
+        # Verify
+        import requests as _r
+        r = _r.get(f"{API_BASE}/users/self",
+                   headers={"Authorization": f"Bearer {args.token.strip()}"})
+        if r.status_code == 200:
+            data = r.json()
+            print(f"Token valid — logged in as: {data.get('name', '?')} (ID: {data.get('id', '?')})")
+        else:
+            print(f"WARNING: Token returned HTTP {r.status_code}. Check validity.")
+    else:
+        token = get_token()
+        if token:
+            print(f"Token configured (masked): {token[:8]}...{token[-4:]}")
+            import requests as _r
+            r = _r.get(f"{API_BASE}/users/self",
+                       headers={"Authorization": f"Bearer {token}"})
+            if r.status_code == 200:
+                data = r.json()
+                print(f"Status: valid — {data.get('name', '?')} (ID: {data.get('id', '?')})")
+                print(f"Lightweight mode: active (API calls use requests, no Playwright overhead)")
+            else:
+                print(f"Status: INVALID (HTTP {r.status_code})")
+        else:
+            print("No token configured. Running in Playwright session mode.")
+            print("To add a token: python canvas.py token <your_canvas_api_token>")
+            print("Get a token from: Canvas → Settings → Approved Integrations → New Access Token")
 
 
 def cmd_login():
@@ -659,6 +774,8 @@ def main():
     p_submit.add_argument("file", help="Path to file to submit")
     sub.add_parser("open", help="Open Canvas in visible browser")
     sub.add_parser("login", help="Manual re-login (opens browser)")
+    p_token = sub.add_parser("token", help="Set or verify Canvas API token (enables lightweight mode)")
+    p_token.add_argument("token", nargs="?", help="Your Canvas API token (leave empty to check status)")
 
     args = parser.parse_args()
 
@@ -683,6 +800,8 @@ def main():
         cmd_open()
     elif args.command == "login":
         cmd_login()
+    elif args.command == "token":
+        cmd_token(args)
     else:
         parser.print_help()
 
