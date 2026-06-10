@@ -1,0 +1,13 @@
+# Canvas@SJTU - Sensitive runtime data (gitignored)
+# 
+# All session cookies, course caches, download files, and login logs
+# are stored here. This directory is excluded from version control.
+#
+# To set up a new instance, just run:
+#   python scripts/login.py
+#
+local/
+
+# Python bytecode
+__pycache__/
+*.pyc
