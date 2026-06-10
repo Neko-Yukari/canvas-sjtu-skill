@@ -8,6 +8,7 @@ Usage:
     python canvas.py assignments <course>        List assignments with deadlines
     python canvas.py submit <course> <asgn> <file>  Submit file to assignment (with confirmation)
     python canvas.py token [<token>]             Set or verify Canvas API token (optional, for lightweight mode)
+    python canvas.py navigate [<path>]           Browse Canvas like a human (returns structured options)
     python canvas.py login                       Re-login (opens browser)
     python canvas.py open                        Open Canvas in visible browser
 
@@ -746,6 +747,246 @@ def cmd_token(args):
             print("Get a token from: Canvas → Settings → Approved Integrations → New Access Token")
 
 
+def cmd_navigate(index, path):
+    """Browse Canvas like a human — return structured options at path."""
+    result = navigate("/" if not path else path, index)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+def navigate(path, index):
+    """
+    Unified Canvas browsing primitive.
+    
+    Paths:
+      /                          → Dashboard (courses + todos)
+      /courses/:id               → Course home (modules, files, assignments, pages, announcements)
+      /courses/:id/modules       → Module list
+      /courses/:id/modules/:mid  → Module items
+      /courses/:id/files         → File list
+      /courses/:id/assignments   → Assignment list
+      /courses/:id/announcements → Announcements
+      /courses/:id/pages         → Pages/wiki
+    
+    Returns structured JSON with items, meta, and nav hints.
+    """
+    parts = [p for p in path.split("/") if p]
+    
+    # ── Root: Dashboard ──
+    if len(parts) == 0:
+        courses = _api_get("/courses", {"enrollment_state": "active", "per_page": "50"})
+        todos = _api_get("/users/self/todo")
+        return {
+            "path": "/",
+            "title": "Dashboard",
+            "items": [
+                {"type": "course", "id": c["id"], "name": c.get("name", c["id"]),
+                 "path": f"/courses/{c['id']}"}
+                for c in (courses or [])
+            ],
+            "todos": [
+                {"id": t.get("assignment", {}).get("id"), "name": t.get("assignment", {}).get("name"),
+                 "course": t.get("context_name", ""),
+                 "due": (t.get("assignment", {}).get("due_at", "") or "")[:16]}
+                for t in (todos or [])
+            ],
+            "nav": ["/courses/:id"],
+            "meta": {"course_count": len(courses or []), "todo_count": len(todos or [])}
+        }
+    
+    # ── /courses/:id/* (check sub-paths BEFORE general /courses/:id) ──
+    if parts[0] == "courses" and len(parts) >= 3:
+        cid = index.resolve(parts[1])
+        sub = parts[2]
+        
+        # /courses/:id/modules[/:mid]
+        if sub == "modules":
+            modules = _api_get(f"/courses/{cid}/modules", {"per_page": "50"})
+            if len(parts) >= 4:
+                mid = parts[3]
+                items = _api_get(f"/courses/{cid}/modules/{mid}/items", {"per_page": "100"})
+                module_name = "Module"
+                if modules:
+                    for m in modules:
+                        if str(m["id"]) == mid:
+                            module_name = m.get("name", mid)
+                return {
+                    "path": path, "title": module_name,
+                    "course_id": int(cid), "module_id": int(mid),
+                    "items": [
+                        {"type": item.get("type", "?"), "id": item["id"],
+                         "name": item.get("title", item["id"]),
+                         "url": item.get("url", ""),
+                         "content_id": item.get("content_id"),
+                         "indent": item.get("indent", 0)
+                        } for item in (items or [])
+                    ],
+                    "nav": [f"/courses/{cid}"],
+                    "meta": {"item_count": len(items or [])}
+                }
+            return {
+                "path": path,
+                "title": f"{index.get_name(cid)} — 模块",
+                "course_id": int(cid),
+                "items": [
+                    {"type": "module", "id": m["id"], "name": m.get("name", m["id"]),
+                     "path": f"/courses/{cid}/modules/{m['id']}",
+                     "items_count": m.get("items_count", 0),
+                     "unlock_at": m.get("unlock_at", ""), "state": m.get("state", "active")}
+                    for m in (modules or [])
+                ],
+                "nav": [f"/courses/{cid}"],
+                "meta": {"module_count": len(modules or [])}
+            }
+        
+        # /courses/:id/files
+        if sub == "files":
+            files = _api_get(f"/courses/{cid}/files", {"per_page": "200", "sort": "name"})
+            return {
+                "path": path, "title": f"{index.get_name(cid)} — 文件", "course_id": int(cid),
+                "items": [
+                    {"type": "file", "id": f["id"],
+                     "name": f.get("display_name") or f.get("filename", "?"),
+                     "size": f.get("size", 0),
+                     "size_str": f"{f.get('size', 0)/1024:.0f}KB" if (f.get("size", 0) < 1024*1024) else f"{f.get('size', 0)/1024/1024:.1f}MB",
+                     "url": f.get("url", ""),
+                     "download_path": f"/courses/{cid}/files/{f['id']}/download"}
+                    for f in (files or [])
+                ],
+                "nav": [f"/courses/{cid}"],
+                "meta": {"file_count": len(files or [])}
+            }
+        
+        # /courses/:id/assignments
+        if sub == "assignments":
+            assgn = _api_get(f"/courses/{cid}/assignments", {"per_page": "50", "order_by": "due_at"})
+            subs = _api_get(f"/courses/{cid}/students/submissions",
+                            {"student_ids[]": "all", "per_page": "50"})
+            sub_map = {}
+            if subs:
+                for s in subs: sub_map[s.get("assignment_id")] = s
+            now = time.time()
+            items = []
+            for a in (assgn or []):
+                a_id = a["id"]
+                sub = sub_map.get(a_id, {})
+                due = a.get("due_at", "")
+                due_ts = None
+                if due:
+                    try:
+                        due_ts = time.mktime(time.strptime(due[:19], "%Y-%m-%dT%H:%M:%S"))
+                    except Exception: pass
+                items.append({
+                    "type": "assignment", "id": a_id, "name": a.get("name", a_id),
+                    "due": due[:16] if due else None,
+                    "points": a.get("points_possible", 0),
+                    "submitted": sub.get("workflow_state", "unsubmitted"),
+                    "score": sub.get("score"),
+                    "status": "CLOSED" if (due_ts and due_ts < now) else "open",
+                    "submission_types": a.get("submission_types", [])
+                })
+            return {
+                "path": path, "title": f"{index.get_name(cid)} — 作业", "course_id": int(cid),
+                "items": items, "nav": [f"/courses/{cid}"],
+                "meta": {"assignment_count": len(assgn or [])}
+            }
+        
+        # /courses/:id/announcements
+        if sub == "announcements":
+            anns = _api_get(f"/announcements", {"context_codes[]": f"course_{cid}", "per_page": "20"})
+            return {
+                "path": path, "title": f"{index.get_name(cid)} — 公告", "course_id": int(cid),
+                "items": [
+                    {"type": "announcement", "id": a["id"], "title": a.get("title", a["id"]),
+                     "posted": a.get("posted_at", "")[:16] if a.get("posted_at") else "",
+                     "author": a.get("author", {}).get("display_name", ""),
+                     "message_preview": (a.get("message", "") or "")[:200].strip()}
+                    for a in (anns or [])
+                ],
+                "nav": [f"/courses/{cid}"],
+                "meta": {"announcement_count": len(anns or [])}
+            }
+        
+        # /courses/:id/pages
+        if sub == "pages":
+            pages = _api_get(f"/courses/{cid}/pages", {"per_page": "50", "sort": "title"})
+            return {
+                "path": path, "title": f"{index.get_name(cid)} — 页面", "course_id": int(cid),
+                "items": [
+                    {"type": "page", "url": p.get("url", ""),
+                     "title": p.get("title", p.get("url", "?")),
+                     "created": p.get("created_at", "")[:16],
+                     "updated": p.get("updated_at", "")[:16]}
+                    for p in (pages or [])
+                ],
+                "nav": [f"/courses/{cid}"],
+                "meta": {"page_count": len(pages or [])}
+            }
+    
+    # ── /courses/:id (course home — must be checked AFTER sub-paths) ──
+    if parts[0] == "courses" and len(parts) == 2:
+        cid = index.resolve(parts[1])
+        name = index.get_name(cid)
+        
+        # Course home: gather summary of all sub-resources
+        items = []
+        nav_children = []
+        
+        # Modules
+        modules = _api_get(f"/courses/{cid}/modules", {"per_page": "50"})
+        if modules:
+            nav_children.append("modules")
+            items.append({"type": "section", "name": "模块", "count": len(modules),
+                          "path": f"/courses/{cid}/modules"})
+            for m in modules[:5]:
+                items.append({"type": "module", "id": m["id"], "name": m.get("name", m["id"]),
+                             "path": f"/courses/{cid}/modules/{m['id']}",
+                             "items_count": m.get("items_count", 0)})
+        
+        # Files
+        files = _api_get(f"/courses/{cid}/files", {"per_page": "200", "sort": "name"})
+        if files:
+            nav_children.append("files")
+            items.append({"type": "section", "name": "文件", "count": len(files),
+                          "path": f"/courses/{cid}/files"})
+        
+        # Assignments
+        assgn = _api_get(f"/courses/{cid}/assignments", {"per_page": "50"})
+        if assgn:
+            nav_children.append("assignments")
+            items.append({"type": "section", "name": "作业", "count": len(assgn),
+                          "path": f"/courses/{cid}/assignments"})
+        
+        # Pages
+        pages = _api_get(f"/courses/{cid}/pages", {"per_page": "50"})
+        if pages:
+            nav_children.append("pages")
+            items.append({"type": "section", "name": "页面", "count": len(pages),
+                          "path": f"/courses/{cid}/pages"})
+        
+        # Announcements
+        anns = _api_get(f"/announcements", {"context_codes[]": f"course_{cid}", "per_page": "20"})
+        if anns:
+            nav_children.append("announcements")
+            items.append({"type": "section", "name": "公告", "count": len(anns),
+                          "path": f"/courses/{cid}/announcements"})
+        
+        return {
+            "path": path,
+            "title": name,
+            "course_id": int(cid),
+            "course_name": name,
+            "items": items,
+            "nav": [f"/courses/{cid}/{child}" for child in nav_children],
+            "meta": {
+                "modules": len(modules or []),
+                "files": len(files or []),
+                "assignments": len(assgn or []),
+                "pages": len(pages or []),
+                "announcements": len(anns or [])
+            }
+        }
+    
+
 def cmd_login():
     """Run manual login script."""
     import subprocess
@@ -761,6 +1002,8 @@ def main():
 
     sub.add_parser("dashboard", help="Show dashboard with courses and deadlines")
     sub.add_parser("courses", help="List all active courses (force-refresh from API)")
+    p_nav = sub.add_parser("navigate", help="Browse Canvas like a human (returns structured JSON)")
+    p_nav.add_argument("path", nargs="?", default="/", help="Canvas path (e.g., /, /courses/88148, /courses/88148/modules)")
     p_files = sub.add_parser("files", help="List files in a course")
     p_files.add_argument("course", help="Course ID or keyword")
     p_dl = sub.add_parser("download", help="Download files matching keyword")
@@ -780,7 +1023,7 @@ def main():
     args = parser.parse_args()
 
     index = None
-    if args.command in ("dashboard", "courses", "files", "download", "assignments", "submit"):
+    if args.command in ("dashboard", "courses", "files", "download", "assignments", "submit", "navigate"):
         index = CourseIndex()
         index.load()
 
@@ -788,6 +1031,8 @@ def main():
         cmd_dashboard(index)
     elif args.command == "courses":
         cmd_courses(index)
+    elif args.command == "navigate":
+        cmd_navigate(index, args.path)
     elif args.command == "files":
         cmd_files(index, args.course)
     elif args.command == "download":
